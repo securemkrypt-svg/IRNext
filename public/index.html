@@ -354,6 +354,25 @@
     document.getElementById("ttydLink").href = LINUX_TTYD_URL;
     document.getElementById("novncLink").href = WIN_NOVNC_URL;
 
+    const SPINNER_SVG = `<svg class="animate-spin inline-block h-3.5 w-3.5 mr-1.5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+   <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+   <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+   </svg>`;
+
+   function setBtnLoading(btn, isLoading, loadingText = "Uploading...") {
+    if (!btn) return;
+       if (isLoading) {
+        btn.dataset.origText = btn.innerHTML;
+        btn.disabled = true;
+        btn.classList.add("opacity-75", "cursor-not-allowed");
+        btn.innerHTML = `${SPINNER_SVG}${loadingText}`;
+       } else {
+        btn.disabled = false;
+        btn.classList.remove("opacity-75", "cursor-not-allowed");
+        btn.innerHTML = btn.dataset.origText || btn.innerHTML;
+       }
+     }
+    
     function switchTab(name, btn) {
       document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
       document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
