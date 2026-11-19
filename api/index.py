@@ -373,25 +373,87 @@ async def gemini_ai_triage(incident_id: str):
     await ensure_db()
     if not gemini_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing")
+
     arm_token = await get_azure_token("https://management.azure.com/.default")
+    headers = {"Authorization": f"Bearer {arm_token}"}
     inc_url = f"{SENTINEL_BASE}/incidents/{incident_id}?api-version={SENTINEL_API_VER}"
+    ent_url = f"{SENTINEL_BASE}/incidents/{incident_id}/entities?api-version={SENTINEL_API_VER}"
+
+    # 1. Fetch Incident Metadata + Mapped Entities in parallel
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(inc_url, headers={"Authorization": f"Bearer {arm_token}"})
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=f"Incident lookup failed: {resp.text}")
-        inc = resp.json()["properties"]
+        inc_resp, ent_resp = await asyncio.gather(
+            client.get(inc_url, headers=headers),
+            client.post(ent_url, headers=headers),
+        )
+        if inc_resp.status_code != 200:
+            raise HTTPException(status_code=inc_resp.status_code, detail=f"Incident lookup failed: {inc_resp.text}")
+        inc = inc_resp.json()["properties"]
+        raw_entities = ent_resp.json().get("entities", []) if ent_resp.status_code == 200 else []
 
-    safe_title = inc.get("title", "").replace("'", "''")
-    host_kql = "union isfuzzy=true (SecurityEvent | where TimeGenerated > ago(1h) | project TimeGenerated, Computer, Activity, EventID), (Syslog | where TimeGenerated > ago(1h) | project TimeGenerated, Computer, ProcessName, SyslogMessage) | top 15 by TimeGenerated desc"
-    related_kql = "SecurityAlert | where TimeGenerated > ago(24h) | summarize Count=count() by AlertName, AlertSeverity | top 10 by Count desc"
+    # 2. Extract unique IPs, Accounts, and Hosts for KQL filtering
+    entity_values = []
+    entity_summary = []
+    for e in raw_entities:
+        kind = e.get("kind", "Entity")
+        p = e.get("properties", {})
+        val = p.get("address") or p.get("accountName") or p.get("hostName") or p.get("url") or p.get("friendlyName")
+        if val:
+            clean_val = str(val).replace("'", "''").strip()
+            if clean_val and clean_val not in entity_values:
+                entity_values.append(clean_val)
+                entity_summary.append(f"{kind}: {clean_val}")
 
-    host_events, related_alerts = await asyncio.gather(run_kql(host_kql, "PT1H"), run_kql(related_kql, "P1D"))
-    prompt = f"Senior SOC Triage for Sentinel Incident '{safe_title}' (Severity: {inc.get('severity')}, Description: {inc.get('description')}).\nProvide concise sections:\n1. Verdict & Confidence\n2. MITRE ATT&CK Mapping\n3. Containment & Eradication Steps\n4. KQL Hunt Query.\n\nRecent Host Logs:\n{host_events}\nRelated 24h Alerts:\n{related_alerts}"
+    # 3. Build Entity-Scoped KQL (falls back to recent workspace logs if no entities exist)
+    if entity_values:
+        kql_list = ", ".join(f"'{v}'" for v in entity_values[:10])
+        entity_kql = f"""
+        union isfuzzy=true
+          (SecurityEvent | where TimeGenerated > ago(24h) | where IpAddress has_any ({kql_list}) or TargetAccount has_any ({kql_list}) or Computer has_any ({kql_list}) | project TimeGenerated, Table="SecurityEvent", Computer, Account=TargetAccount, IP=IpAddress, Detail=Activity),
+          (Syslog | where TimeGenerated > ago(24h) | where SyslogMessage has_any ({kql_list}) or Computer has_any ({kql_list}) | project TimeGenerated, Table="Syslog", Computer, Account="", IP="", Detail=SyslogMessage)
+        | top 25 by TimeGenerated desc
+        """
+        related_kql = f"""
+        SecurityAlert
+        | where TimeGenerated > ago(7d)
+        | where Entities has_any ({kql_list}) or AlertName has_any ({kql_list})
+        | summarize Count=count(), LastSeen=max(TimeGenerated) by AlertName, AlertSeverity
+        | top 10 by Count desc
+        """
+    else:
+        entity_kql = """
+        union isfuzzy=true
+          (SecurityEvent | where TimeGenerated > ago(1h) | project TimeGenerated, Table="SecurityEvent", Computer, Detail=Activity),
+          (Syslog | where TimeGenerated > ago(1h) | project TimeGenerated, Table="Syslog", Computer, Detail=SyslogMessage)
+        | top 15 by TimeGenerated desc
+        """
+        related_kql = "SecurityAlert | where TimeGenerated > ago(24h) | summarize Count=count() by AlertName, AlertSeverity | top 10 by Count desc"
+
+    entity_logs, related_alerts = await asyncio.gather(
+        run_kql(entity_kql, "P1D"),
+        run_kql(related_kql, "P7D"),
+    )
+
+    safe_title = inc.get("title", "")
+    prompt = (
+        f"You are a Senior SOC Analyst. Triage Sentinel Incident '{safe_title}' "
+        f"(Severity: {inc.get('severity')}, Description: {inc.get('description')}).\n"
+        f"Mapped Entities: {', '.join(entity_summary) or 'None'}\n\n"
+        f"Provide concise sections:\n"
+        f"1. Verdict & Confidence\n"
+        f"2. Entity-Specific Log Findings (cite exact timestamps, IPs, accounts, hosts)\n"
+        f"3. MITRE ATT&CK Mapping\n"
+        f"4. Containment & Eradication Steps\n"
+        f"5. Targeted KQL Hunt Query\n\n"
+        f"Entity-Scoped Logs (Last 24h):\n{entity_logs}\n\n"
+        f"Related Alerts for These Entities (Last 7d):\n{related_alerts}"
+    )
 
     analysis_text, last_error = None, ""
     for model_name in ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash"):
         try:
-            ai_resp = await asyncio.to_thread(gemini_client.models.generate_content, model=model_name, contents=prompt)
+            ai_resp = await asyncio.to_thread(
+                gemini_client.models.generate_content, model=model_name, contents=prompt
+            )
             if ai_resp and ai_resp.text:
                 analysis_text = ai_resp.text
                 break
@@ -401,7 +463,10 @@ async def gemini_ai_triage(incident_id: str):
     if not analysis_text:
         raise HTTPException(status_code=502, detail=f"Gemini triage error: {last_error}")
 
-    await turso_exec("UPDATE ticket_state SET ai_analysis = ?, updated_at = ? WHERE incident_id = ?", [analysis_text, datetime.now(timezone.utc).isoformat(), incident_id])
+    await turso_exec(
+        "UPDATE ticket_state SET ai_analysis = ?, updated_at = ? WHERE incident_id = ?",
+        [analysis_text, datetime.now(timezone.utc).isoformat(), incident_id],
+    )
     return {"incident_id": incident_id, "ai_analysis": analysis_text}
 
 # --- 7. Metrics, Topology, VMs & KQL ---
