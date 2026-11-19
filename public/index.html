@@ -914,7 +914,49 @@
       const txt = document.getElementById(`presetKqlText_${idx}`).textContent;
       document.getElementById("kqlInput").value = txt;
       runKqlQuery();
-    }
+    }async def run_kql(query: str, timespan: str = "P7D") -> list[dict]:
+    try:
+        token = await get_azure_token("https://api.loganalytics.io/.default")
+        url = f"https://api.loganalytics.io/v1/workspaces/{WS_ID}/query"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                json={"query": query, "timespan": timespan},
+            )
+            if resp.status_code != 200:
+                return []
+            tables = resp.json().get("tables", [])
+            if not tables:
+                return []
+            cols = [c["name"] for c in tables[0]["columns"]]
+            return [dict(zip(cols, row)) for row in tables[0]["rows"]]
+    except Exception:
+        return []  # Don't block Gemini if KQL times out
+
+@app.get("/api/incidents/{incident_id}/entities")
+async def get_incident_entities(incident_id: str):
+    arm_token = await get_azure_token("https://management.azure.com/.default")
+    url = f"{SENTINEL_BASE}/incidents/{incident_id}/entities?api-version={SENTINEL_API_VER}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, headers={"Authorization": f"Bearer {arm_token}"})
+        if resp.status_code != 200:
+            return {"entities": []}
+        raw = resp.json().get("entities", [])
+        parsed = []
+        for e in raw:
+            kind = e.get("kind", "Entity")
+            p = e.get("properties", {})
+            value = (
+                p.get("address")
+                or p.get("accountName")
+                or p.get("hostName")
+                or p.get("url")
+                or p.get("friendlyName")
+                or e.get("name")
+            )
+            parsed.append({"kind": kind, "value": value, "raw": p})
+        return {"entities": parsed}
 
     async function runKqlQuery() {
       const query = document.getElementById("kqlInput").value;
