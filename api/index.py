@@ -389,7 +389,7 @@ async def gemini_ai_triage(incident_id: str):
     prompt = f"Senior SOC Triage for Sentinel Incident '{safe_title}' (Severity: {inc.get('severity')}, Description: {inc.get('description')}).\nProvide concise sections:\n1. Verdict & Confidence\n2. MITRE ATT&CK Mapping\n3. Containment & Eradication Steps\n4. KQL Hunt Query.\n\nRecent Host Logs:\n{host_events}\nRelated 24h Alerts:\n{related_alerts}"
 
     analysis_text, last_error = None, ""
-    for model_name in ("gemini-2.5-flash", "gemini-2.0-flash"):
+    for model_name in ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash"):
         try:
             ai_resp = await asyncio.to_thread(gemini_client.models.generate_content, model=model_name, contents=prompt)
             if ai_resp and ai_resp.text:
