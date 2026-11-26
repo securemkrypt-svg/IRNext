@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from google import genai
+from google.genai.errors import APIError
 
 load_dotenv()
 
@@ -372,14 +373,13 @@ async def add_bidirectional_work_note(incident_id: str, body: WorkNoteRequest):
 async def gemini_ai_triage(incident_id: str):
     await ensure_db()
     if not gemini_client:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing")
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing in Vercel environment variables")
 
     arm_token = await get_azure_token("https://management.azure.com/.default")
     headers = {"Authorization": f"Bearer {arm_token}"}
     inc_url = f"{SENTINEL_BASE}/incidents/{incident_id}?api-version={SENTINEL_API_VER}"
     ent_url = f"{SENTINEL_BASE}/incidents/{incident_id}/entities?api-version={SENTINEL_API_VER}"
 
-    # 1. Fetch Incident Metadata + Mapped Entities in parallel
     async with httpx.AsyncClient(timeout=15) as client:
         inc_resp, ent_resp = await asyncio.gather(
             client.get(inc_url, headers=headers),
@@ -390,9 +390,7 @@ async def gemini_ai_triage(incident_id: str):
         inc = inc_resp.json()["properties"]
         raw_entities = ent_resp.json().get("entities", []) if ent_resp.status_code == 200 else []
 
-    # 2. Extract unique IPs, Accounts, and Hosts for KQL filtering
-    entity_values = []
-    entity_summary = []
+    entity_values, entity_summary = [], []
     for e in raw_entities:
         kind = e.get("kind", "Entity")
         p = e.get("properties", {})
@@ -403,7 +401,6 @@ async def gemini_ai_triage(incident_id: str):
                 entity_values.append(clean_val)
                 entity_summary.append(f"{kind}: {clean_val}")
 
-    # 3. Build Entity-Scoped KQL (falls back to recent workspace logs if no entities exist)
     if entity_values:
         kql_list = ", ".join(f"'{v}'" for v in entity_values[:10])
         entity_kql = f"""
@@ -448,8 +445,8 @@ async def gemini_ai_triage(incident_id: str):
         f"Related Alerts for These Entities (Last 7d):\n{related_alerts}"
     )
 
-    analysis_text, last_error = None, ""
-    for model_name in ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash"):
+    analysis_text, last_status, last_error = None, 502, "Unknown Gemini error"
+    for model_name in ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"):
         try:
             ai_resp = await asyncio.to_thread(
                 gemini_client.models.generate_content, model=model_name, contents=prompt
@@ -457,18 +454,24 @@ async def gemini_ai_triage(incident_id: str):
             if ai_resp and ai_resp.text:
                 analysis_text = ai_resp.text
                 break
+        except APIError as api_exc:
+            last_status = api_exc.code or 502
+            last_error = f"[{model_name}] {api_exc.message or str(api_exc)}"
+            # Stop retrying immediately if API key is invalid or quota is exhausted
+            if last_status in (400, 401, 403, 429):
+                break
         except Exception as exc:
-            last_error = str(exc)
+            last_status = 500
+            last_error = f"[{model_name}] {str(exc)}"
 
     if not analysis_text:
-        raise HTTPException(status_code=502, detail=f"Gemini triage error: {last_error}")
+        raise HTTPException(status_code=last_status, detail=last_error)
 
     await turso_exec(
         "UPDATE ticket_state SET ai_analysis = ?, updated_at = ? WHERE incident_id = ?",
         [analysis_text, datetime.now(timezone.utc).isoformat(), incident_id],
     )
     return {"incident_id": incident_id, "ai_analysis": analysis_text}
-
 # --- 7. Metrics, Topology, VMs & KQL ---
 @app.get("/api/metrics")
 async def get_soc_metrics():
