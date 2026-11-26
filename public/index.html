@@ -195,10 +195,18 @@
     const SPINNER_SVG = `<svg class="animate-spin inline-block h-3.5 w-3.5 mr-1.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>`;
 
     let incidentsCache = [], analystsCache = [], selectedIncidentId = null, pendingStage = null;
-    let aiLoadingIncidentId = null, aiPanelOpen = true, aiErrorByIncident = {};
+    let aiLoadingIncidentId = null, aiLoadingStep = "", aiPanelOpen = true, aiErrorByIncident = {};
 
     document.getElementById("frame-linux").src = LINUX_TTYD_URL; document.getElementById("link-linux").href = LINUX_TTYD_URL;
     document.getElementById("frame-win").src = WIN_NOVNC_URL; document.getElementById("link-win").href = WIN_NOVNC_URL;
+
+    function escapeHtml(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
 
     function showToast(msg, type = "info") {
       const colors = type === "error" ? "bg-rose-950 border-rose-500/60 text-rose-200" : type === "success" ? "bg-emerald-950 border-emerald-500/60 text-emerald-200" : "bg-slate-900 border-cyan-500/60 text-cyan-200";
@@ -287,9 +295,9 @@
             ${formatSlaBadge(inc.created_time, inc.sla_minutes, inc.sentinel_status)}
             <span class="text-[10px] font-mono px-1.5 py-0.5 rounded border ${inc.severity === "High" ? "text-rose-400 border-rose-500/40" : "text-amber-300 border-amber-500/40"}">${inc.severity}</span>
           </div>
-          <div class="font-medium text-white text-xs leading-snug">${inc.title}</div>
+          <div class="font-medium text-white text-xs leading-snug">${escapeHtml(inc.title)}</div>
           <div class="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-1">
-            <span>Assignee: <span class="text-slate-200">${inc.assigned_to}</span></span>
+            <span>Assignee: <span class="text-slate-200">${escapeHtml(inc.assigned_to)}</span></span>
             <span>${new Date(inc.created_time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
           </div>
         </div>`).join("");
@@ -309,8 +317,10 @@
       const isAssignedLocked = inc.assigned_to && inc.assigned_to !== "T1-Triage-Bin";
       const nextStageIdx = Math.min(IR_STAGES.indexOf(inc.ir_stage) + 1, IR_STAGES.length - 1);
       const nextStage = IR_STAGES[nextStageIdx];
+      const aiErr = aiErrorByIncident[incId];
+      const isAiLoading = aiLoadingIncidentId === incId;
 
-      const analystOptions = analystsCache.map(a => `<option value="${a.name}" ${a.name === inc.assigned_to ? "selected" : ""}>${a.name} (${a.role})</option>`).join("");
+      const analystOptions = analystsCache.map(a => `<option value="${escapeHtml(a.name)}" ${a.name === inc.assigned_to ? "selected" : ""}>${escapeHtml(a.name)} (${escapeHtml(a.role)})</option>`).join("");
       const stageStepsHtml = IR_STAGES.map((st, idx) => {
         const done = inc.ir_timestamps?.[st];
         const isCurrent = st === inc.ir_stage;
@@ -323,8 +333,8 @@
 
       const notesHtml = (inc.work_notes || []).map(n => `
         <div class="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3 text-xs">
-          <div class="flex justify-between text-[10px] font-mono text-slate-400 mb-1"><span class="text-cyan-300 font-semibold">${n.author}</span><span>${new Date(n.created_at).toLocaleString()} • Synced</span></div>
-          <div class="text-slate-200">${n.note}</div>
+          <div class="flex justify-between text-[10px] font-mono text-slate-400 mb-1"><span class="text-cyan-300 font-semibold">${escapeHtml(n.author)}</span><span>${new Date(n.created_at).toLocaleString()} • Synced</span></div>
+          <div class="text-slate-200">${escapeHtml(n.note)}</div>
         </div>`).join("") || `<div class="text-xs font-mono text-slate-500 py-2">No work notes logged yet.</div>`;
 
       detailEl.className = "text-left space-y-4";
@@ -364,14 +374,14 @@
           <!-- Title Row + Compact Right-Aligned Action Buttons -->
           <div class="flex flex-wrap items-start justify-between gap-4">
             <div class="space-y-1 flex-1 min-w-[260px]">
-              <h2 class="text-lg font-cyber font-bold text-white leading-tight">${inc.title}</h2>
-              <p class="text-xs text-slate-400">${inc.description || "No description provided."} • <span class="font-mono text-slate-500">Created: ${new Date(inc.created_time).toLocaleString()}</span></p>
+              <h2 class="text-lg font-cyber font-bold text-white leading-tight">${escapeHtml(inc.title)}</h2>
+              <p class="text-xs text-slate-400">${escapeHtml(inc.description || "No description provided.")} • <span class="font-mono text-slate-500">Created: ${new Date(inc.created_time).toLocaleString()}</span></p>
             </div>
 
-            <!-- 3 Compact Action Icon Buttons on the Right -->
+            <!-- Compact Action Icon Buttons on the Right -->
             <div class="flex items-center gap-2 shrink-0">
-              <button type="button" onclick="runAiTriage('${incId}')" title="Run Gemini AI Triage" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 transition">
-                ✦ AI Triage
+              <button type="button" onclick="runAiTriage('${incId}')" ${isAiLoading ? "disabled" : ""} title="Run Two-Step KQL + Gemini AI Triage" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold ${isAiLoading ? "bg-cyan-500/10 text-cyan-400/60 cursor-not-allowed" : "bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300"} border border-cyan-500/40 transition">
+                ${isAiLoading ? `${SPINNER_SVG}Triaging...` : "✦ AI Triage"}
               </button>
               <button type="button" onclick="openStageModal('${nextStage}')" title="Advance to ${nextStage}" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/40 transition">
                 ➜ ${nextStage}
@@ -380,15 +390,15 @@
           </div>
         </div>
 
-        <!-- Collapsible Gemini AI Triage Dropdown -->
-        <div class="bg-slate-950/90 border ${aiErrorByIncident[incId] ? "border-rose-500/50" : "border-indigo-500/30"} rounded-xl overflow-hidden">
+        <!-- Collapsible Gemini AI Triage Dropdown with Inline HTTP Error Badge -->
+        <div class="bg-slate-950/90 border ${aiErr ? "border-rose-500/50" : "border-indigo-500/30"} rounded-xl overflow-hidden">
           <button type="button" onclick="toggleAiPanel()" class="w-full px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-left hover:bg-slate-900/60 transition">
             <div class="flex flex-wrap items-center gap-2.5">
               <span class="text-xs font-cyber font-semibold text-indigo-300 uppercase tracking-wider">✦ Gemini AI Triage & KQL Hunt Queries</span>
-              ${aiErrorByIncident[incId] ? `
-                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md font-mono text-[11px] bg-rose-950/90 border border-rose-500/50 text-rose-200">
-                  <strong class="text-rose-400">HTTP ${aiErrorByIncident[incId].code}</strong>
-                  <span class="truncate max-w-[420px]">— ${aiErrorByIncident[incId].message}</span>
+              ${aiErr ? `
+                <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md font-mono text-[11px] bg-rose-950/90 border border-rose-500/50 text-rose-200">
+                  <strong class="text-rose-400">HTTP ${escapeHtml(aiErr.code)}</strong>
+                  <span class="truncate max-w-[440px]">— ${escapeHtml(aiErr.message)}</span>
                 </span>
               ` : ""}
             </div>
@@ -396,11 +406,11 @@
           </button>
           <div id="ai-panel-body" class="${aiPanelOpen ? "" : "hidden"} px-4 pb-4 pt-2 border-t border-slate-800/70">
             <pre id="ai-triage-box" class="text-xs text-slate-300 whitespace-pre-wrap font-sans leading-relaxed">${
-              aiLoadingIncidentId === incId
-                ? `<span class="text-cyan-400 animate-pulse font-mono">⚡ Correlating KQL telemetry & running Gemini AI...</span>`
-                : aiErrorByIncident[incId]
-                  ? `<span class="text-rose-300 font-mono">[HTTP ${aiErrorByIncident[incId].code}] ${aiErrorByIncident[incId].message}</span>`
-                  : (inc.ai_analysis || "Click '✦ AI Triage' above to correlate logs and generate containment steps.")
+              isAiLoading
+                ? `<span class="text-cyan-400 animate-pulse font-mono">⚡ ${escapeHtml(aiLoadingStep || "Running two-step AI Triage...")}</span>`
+                : aiErr
+                  ? `<span class="text-rose-300 font-mono">[HTTP ${escapeHtml(aiErr.code)}] ${escapeHtml(aiErr.message)}</span>`
+                  : escapeHtml(inc.ai_analysis || "Click '✦ AI Triage' above to correlate logs and generate containment steps.")
             }</pre>
           </div>
         </div>
@@ -414,7 +424,7 @@
           <div id="entity-pills" class="flex flex-wrap gap-2 text-xs font-mono"></div>
           <details class="pt-2 border-t border-slate-800/80">
             <summary class="cursor-pointer text-[11px] font-mono text-slate-400 hover:text-cyan-300 select-none">{ } View Raw Sentinel Incident JSON</summary>
-            <pre class="mt-2 p-3 rounded-lg bg-black/70 border border-slate-800 text-[11px] font-mono text-emerald-300 overflow-x-auto max-h-52">${JSON.stringify(inc.raw_properties || inc, null, 2)}</pre>
+            <pre class="mt-2 p-3 rounded-lg bg-black/70 border border-slate-800 text-[11px] font-mono text-emerald-300 overflow-x-auto max-h-52">${escapeHtml(JSON.stringify(inc.raw_properties || inc, null, 2))}</pre>
           </details>
         </div>
 
@@ -459,7 +469,7 @@
         const data = await (await fetch(`${API_BASE}/api/incidents/${incId}/entities`)).json();
         const list = data.entities || [];
         countEl.textContent = `${list.length} entities`;
-        pillsEl.innerHTML = list.length ? list.map(e => `<span class="px-2 py-1 rounded-md bg-slate-900 border border-cyan-500/30 text-slate-200"><strong class="text-cyan-400">${e.kind}:</strong> ${e.value}</span>`).join("") : `<span class="text-slate-500">No entities mapped.</span>`;
+        pillsEl.innerHTML = list.length ? list.map(e => `<span class="px-2 py-1 rounded-md bg-slate-900 border border-cyan-500/30 text-slate-200"><strong class="text-cyan-400">${escapeHtml(e.kind)}:</strong> ${escapeHtml(e.value)}</span>`).join("") : `<span class="text-slate-500">No entities mapped.</span>`;
       } catch { countEl.textContent = "Unavailable"; }
     }
 
@@ -512,30 +522,60 @@
 
     async function runAiTriage(incId) {
       aiLoadingIncidentId = incId;
+      aiLoadingStep = "Step 1/2: Querying Sentinel KQL & entity logs...";
       delete aiErrorByIncident[incId];
       aiPanelOpen = true;
       renderIncidentDetail(incId);
-      try {
-        const res = await fetch(`${API_BASE}/api/incidents/${incId}/ai-triage`, { method: "POST" });
-        const rawText = await res.text();
-        let data = {};
-        try { data = JSON.parse(rawText); } catch { data = { detail: rawText || res.statusText }; }
-        const inc = incidentsCache.find(i => i.incident_id === incId);
 
-        if (res.ok && inc) {
-          inc.ai_analysis = data.ai_analysis;
+      try {
+        // STEP 1: Fetch Sentinel Metadata + Entity-Scoped KQL Telemetry
+        const ctxRes = await fetch(`${API_BASE}/api/incidents/${incId}/triage-context`, { method: "POST" });
+        const ctxRaw = await ctxRes.text();
+        let ctxData = {};
+        try { ctxData = JSON.parse(ctxRaw); } catch { ctxData = { detail: ctxRaw || ctxRes.statusText }; }
+
+        if (!ctxRes.ok) {
+          const errMsg = `Step 1 (KQL Context) failed: ${ctxData.detail || ctxRes.statusText}`;
+          aiErrorByIncident[incId] = { code: ctxRes.status, message: errMsg };
+          showToast(`HTTP ${ctxRes.status}: ${errMsg}`, "error");
+          return;
+        }
+
+        // Update live progress text with KQL row counts before calling Gemini
+        const logCount = (ctxData.entity_logs || []).length;
+        const alertCount = (ctxData.related_alerts || []).length;
+        aiLoadingStep = `Step 2/2: Collected ${logCount} KQL events & ${alertCount} related alerts — investigating with Gemini AI...`;
+        const boxEl = document.getElementById("ai-triage-box");
+        if (boxEl) {
+          boxEl.innerHTML = `<span class="text-cyan-400 animate-pulse font-mono">⚡ ${escapeHtml(aiLoadingStep)}</span>`;
+        }
+
+        // STEP 2: Send KQL Context to Gemini AI for Investigation
+        const aiRes = await fetch(`${API_BASE}/api/incidents/${incId}/ai-investigate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(ctxData),
+        });
+        const aiRaw = await aiRes.text();
+        let aiData = {};
+        try { aiData = JSON.parse(aiRaw); } catch { aiData = { detail: aiRaw || aiRes.statusText }; }
+
+        const inc = incidentsCache.find(i => i.incident_id === incId);
+        if (aiRes.ok && inc) {
+          inc.ai_analysis = aiData.ai_analysis;
           delete aiErrorByIncident[incId];
           showToast("Gemini AI Triage complete", "success");
         } else {
-          const errMsg = data.detail || res.statusText || "Request failed";
-          aiErrorByIncident[incId] = { code: res.status, message: errMsg };
-          showToast(`HTTP ${res.status}: ${errMsg}`, "error");
+          const errMsg = `Step 2 (Gemini AI) failed: ${aiData.detail || aiRes.statusText}`;
+          aiErrorByIncident[incId] = { code: aiRes.status, message: errMsg };
+          showToast(`HTTP ${aiRes.status}: ${errMsg}`, "error");
         }
       } catch (e) {
         aiErrorByIncident[incId] = { code: "NET", message: e.message || "Network unreachable" };
         showToast(`Network error: ${e.message}`, "error");
       } finally {
         aiLoadingIncidentId = null;
+        aiLoadingStep = "";
         if (selectedIncidentId === incId) {
           renderIncidentDetail(incId);
           loadEntities(incId);
@@ -546,7 +586,7 @@
     async function loadMetrics() {
       const m = await (await fetch(`${API_BASE}/api/metrics`)).json();
       document.getElementById("kpi-mtta").textContent = `${m.mtta_mins} min`; document.getElementById("kpi-mtti").textContent = `${m.mtti_mins} min`; document.getElementById("kpi-mttr").textContent = `${m.mttr_mins} min`; document.getElementById("kpi-sla").textContent = `${m.sla_compliance_pct}%`; document.getElementById("kpi-sla-sub").textContent = `${m.sla_breached} breaches / ${m.total_tracked} tracked`;
-      document.getElementById("metrics-ledger").innerHTML = (m.ledger || []).map(r => `<tr><td class="py-2 pr-3 text-white">${r.ticket_number}</td><td class="py-2 pr-3">${r.severity}</td><td class="py-2 pr-3">${r.assignee}</td><td class="py-2 pr-3 text-cyan-300">${r.stage}</td><td class="py-2 pr-3">${r.ack_mins ?? "--"}</td><td class="py-2 pr-3">${r.contain_mins ?? "--"}</td><td class="py-2 pr-3">${r.resolve_mins ?? "--"}</td><td class="py-2 font-semibold ${r.sla_status === "BREACHED" ? "text-rose-400" : "text-emerald-400"}">${r.sla_status}</td></tr>`).join("") || `<tr><td colspan="8" class="py-4 text-center text-slate-500">No tracked incidents yet.</td></tr>`;
+      document.getElementById("metrics-ledger").innerHTML = (m.ledger || []).map(r => `<tr><td class="py-2 pr-3 text-white">${escapeHtml(r.ticket_number)}</td><td class="py-2 pr-3">${escapeHtml(r.severity)}</td><td class="py-2 pr-3">${escapeHtml(r.assignee)}</td><td class="py-2 pr-3 text-cyan-300">${escapeHtml(r.stage)}</td><td class="py-2 pr-3">${r.ack_mins ?? "--"}</td><td class="py-2 pr-3">${r.contain_mins ?? "--"}</td><td class="py-2 pr-3">${r.resolve_mins ?? "--"}</td><td class="py-2 font-semibold ${r.sla_status === "BREACHED" ? "text-rose-400" : "text-emerald-400"}">${r.sla_status}</td></tr>`).join("") || `<tr><td colspan="8" class="py-4 text-center text-slate-500">No tracked incidents yet.</td></tr>`;
     }
 
     async function loadTopology() {
