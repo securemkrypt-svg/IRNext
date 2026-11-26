@@ -369,8 +369,138 @@ async def add_bidirectional_work_note(incident_id: str, body: WorkNoteRequest):
     await turso_exec("INSERT INTO work_notes (id, incident_id, author, note, synced_to_sentinel, created_at) VALUES (?, ?, ?, ?, 1, ?)", [comment_id, incident_id, body.author, body.note, now_iso])
     return {"status": "Synced to Sentinel", "comment_id": comment_id}
 
-@app.post("/api/incidents/{incident_id}/ai-triage")
-async def gemini_ai_triage(incident_id: str):
+class AiInvestigateRequest(BaseModel):
+    title: str
+    severity: str = "Medium"
+    description: str = ""
+    entities: list[str] = []
+    entity_logs: list[dict] = []
+    related_alerts: list[dict] = []
+
+
+@app.post("/api/incidents/{incident_id}/triage-context")
+async def get_triage_context(incident_id: str):
+    arm_token = await get_azure_token("https://management.azure.com/.default")
+    headers = {"Authorization": f"Bearer {arm_token}"}
+    inc_url = f"{SENTINEL_BASE}/incidents/{incident_id}?api-version={SENTINEL_API_VER}"
+    ent_url = f"{SENTINEL_BASE}/incidents/{incident_id}/entities?api-version={SENTINEL_API_VER}"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        inc_resp, ent_resp = await asyncio.gather(
+            client.get(inc_url, headers=headers),
+            client.post(ent_url, headers=headers),
+        )
+        if inc_resp.status_code != 200:
+            raise HTTPException(status_code=inc_resp.status_code, detail=f"Incident lookup failed: {inc_resp.text}")
+        inc = inc_resp.json()["properties"]
+        raw_entities = ent_resp.json().get("entities", []) if ent_resp.status_code == 200 else []
+
+    entity_values, entity_summary = [], []
+    for e in raw_entities:
+        kind = e.get("kind", "Entity")
+        p = e.get("properties", {})
+        val = p.get("address") or p.get("accountName") or p.get("hostName") or p.get("url") or p.get("friendlyName")
+        if val:
+            clean_val = str(val).replace("'", "''").strip()
+            if clean_val and clean_val not in entity_values:
+                entity_values.append(clean_val)
+                entity_summary.append(f"{kind}: {clean_val}")
+
+    if entity_values:
+        kql_list = ", ".join(f"'{v}'" for v in entity_values[:10])
+        entity_kql = f"""
+        union isfuzzy=true
+          (SecurityEvent | where TimeGenerated > ago(24h) | where IpAddress has_any ({kql_list}) or TargetAccount has_any ({kql_list}) or Computer has_any ({kql_list}) | project TimeGenerated, Table="SecurityEvent", Computer, Account=TargetAccount, IP=IpAddress, Detail=Activity),
+          (Syslog | where TimeGenerated > ago(24h) | where SyslogMessage has_any ({kql_list}) or Computer has_any ({kql_list}) | project TimeGenerated, Table="Syslog", Computer, Account="", IP="", Detail=SyslogMessage)
+        | top 20 by TimeGenerated desc
+        """
+        related_kql = f"""
+        SecurityAlert
+        | where TimeGenerated > ago(7d)
+        | where Entities has_any ({kql_list}) or AlertName has_any ({kql_list})
+        | summarize Count=count(), LastSeen=max(TimeGenerated) by AlertName, AlertSeverity
+        | top 10 by Count desc
+        """
+    else:
+        entity_kql = """
+        union isfuzzy=true
+          (SecurityEvent | where TimeGenerated > ago(1h) | project TimeGenerated, Table="SecurityEvent", Computer, Detail=Activity),
+          (Syslog | where TimeGenerated > ago(1h) | project TimeGenerated, Table="Syslog", Computer, Detail=SyslogMessage)
+        | top 15 by TimeGenerated desc
+        """
+        related_kql = "SecurityAlert | where TimeGenerated > ago(24h) | summarize Count=count() by AlertName, AlertSeverity | top 10 by Count desc"
+
+    entity_logs, related_alerts = await asyncio.gather(
+        run_kql(entity_kql, "P1D"),
+        run_kql(related_kql, "P7D"),
+    )
+
+    return {
+        "incident_id": incident_id,
+        "title": inc.get("title", ""),
+        "severity": inc.get("severity", "Medium"),
+        "description": inc.get("description", ""),
+        "entities": entity_summary,
+        "entity_logs": entity_logs,
+        "related_alerts": related_alerts,
+    }
+
+
+@app.post("/api/incidents/{incident_id}/ai-investigate")
+async def ai_investigate_incident(incident_id: str, body: AiInvestigateRequest):
+    await ensure_db()
+    if not gemini_client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing in Vercel environment variables")
+
+    prompt = (
+        f"You are a Senior SOC Analyst. Triage Sentinel Incident '{body.title}' "
+        f"(Severity: {body.severity}, Description: {body.description}).\n"
+        f"Mapped Entities: {', '.join(body.entities) or 'None'}\n\n"
+        f"Provide concise sections:\n"
+        f"1. Verdict & Confidence\n"
+        f"2. Entity-Specific Log Findings (cite exact timestamps, IPs, accounts, hosts)\n"
+        f"3. MITRE ATT&CK Mapping\n"
+        f"4. Containment & Eradication Steps\n"
+        f"5. Targeted KQL Hunt Query\n\n"
+        f"Entity-Scoped Logs (Last 24h):\n{body.entity_logs[:20]}\n\n"
+        f"Related Alerts for These Entities (Last 7d):\n{body.related_alerts[:10]}"
+    )
+
+    analysis_text, last_status, last_error = None, 502, "Unknown Gemini error"
+    # Prioritize low-latency models first so serverless execution stays well under 10s
+    for model_name in ("gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"):
+        try:
+            ai_resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    gemini_client.models.generate_content,
+                    model=model_name,
+                    contents=prompt,
+                ),
+                timeout=18.0,
+            )
+            if ai_resp and ai_resp.text:
+                analysis_text = ai_resp.text
+                break
+        except asyncio.TimeoutError:
+            last_status = 504
+            last_error = f"[{model_name}] Gemini model timed out after 18s"
+        except APIError as api_exc:
+            last_status = api_exc.code or 502
+            last_error = f"[{model_name}] {api_exc.message or str(api_exc)}"
+            if last_status in (400, 401, 403, 429):
+                break
+        except Exception as exc:
+            last_status = 500
+            last_error = f"[{model_name}] {str(exc)}"
+
+    if not analysis_text:
+        raise HTTPException(status_code=last_status, detail=last_error)
+
+    await turso_exec(
+        "UPDATE ticket_state SET ai_analysis = ?, updated_at = ? WHERE incident_id = ?",
+        [analysis_text, datetime.now(timezone.utc).isoformat(), incident_id],
+    )
+    return {"incident_id": incident_id, "ai_analysis": analysis_text}
     await ensure_db()
     if not gemini_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing in Vercel environment variables")
